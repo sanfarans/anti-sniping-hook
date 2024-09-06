@@ -15,6 +15,7 @@ import {PoolSwapTest} from "v4-core/test/PoolSwapTest.sol";
 import {AntiSnipingHook} from "../src/AntiSnipingHook.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
 import {console} from "forge-std/console.sol";
+import {Position} from "v4-core/libraries/Position.sol";
 
 contract TestGasPriceFeesHook is Test, Deployers {
     using CurrencyLibrary for Currency;
@@ -32,18 +33,84 @@ contract TestGasPriceFeesHook is Test, Deployers {
         hook = AntiSnipingHook(hookAddress);
 
         (key,) = initPool(currency0, currency1, hook, 3000, SQRT_PRICE_1_1, ZERO_BYTES);
+    }
+
+    function test_savesPositionCreationBlockNumber() public {
+        uint256 blockNumber = 42;
+        vm.roll(blockNumber);
+
+        address lpAddress = address(modifyLiquidityRouter);
 
         modifyLiquidityRouter.modifyLiquidity(
             key,
             IPoolManager.ModifyLiquidityParams({
                 tickLower: -60,
                 tickUpper: 60,
-                liquidityDelta: 100 ether,
+                liquidityDelta: 10 ether,
+                salt: bytes32(0)
+            }),
+            ZERO_BYTES
+        );
+
+        assertEq(
+            hook.positionCreationBlockNumber(Position.calculatePositionKey(lpAddress, -60, 60, bytes32(0))), blockNumber
+        );
+    }
+
+    function test_timeLockRevertsLiquidityRemoval() public {
+        // adds liquidity
+        modifyLiquidityRouter.modifyLiquidity(
+            key,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: 10 ether,
+                salt: bytes32(0)
+            }),
+            ZERO_BYTES
+        );
+        // waits couple blocks < positionLockDuration
+        assertLt(5, hook.positionLockDuration());
+        vm.roll(vm.getBlockNumber() + 5);
+        // tries to remove liquidity
+        vm.expectRevert();
+        modifyLiquidityRouter.modifyLiquidity(
+            key,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: -10 ether,
                 salt: bytes32(0)
             }),
             ZERO_BYTES
         );
     }
 
-    function test_logsPositionCreationBlockNumber() public {}
+    function test_timeLockExpiresEnablesLiquidityRemoval() public {
+        // adds liquidity
+        modifyLiquidityRouter.modifyLiquidity(
+            key,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: 10 ether,
+                salt: bytes32(0)
+            }),
+            ZERO_BYTES
+        );
+        // waits enough blocks
+        uint256 lockDuration = hook.positionLockDuration();
+        vm.roll(block.number + lockDuration);
+        // successfully removes liquidity
+        modifyLiquidityRouter.modifyLiquidity(
+            key,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: -10 ether,
+                salt: bytes32(0)
+            }),
+            ZERO_BYTES
+        );
+    }
 }
