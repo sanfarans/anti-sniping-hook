@@ -27,7 +27,12 @@ contract TestGasPriceFeesHook is Test, Deployers {
         deployFreshManagerAndRouters();
         deployMintAndApprove2Currencies();
 
-        address hookAddress = address(uint160(Hooks.BEFORE_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG));
+        address hookAddress = address(
+            uint160(
+                Hooks.BEFORE_ADD_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG
+                    | Hooks.BEFORE_DONATE_FLAG | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG
+            )
+        );
 
         deployCodeTo("AntiSnipingHook", abi.encode(manager), hookAddress);
         hook = AntiSnipingHook(hookAddress);
@@ -51,10 +56,9 @@ contract TestGasPriceFeesHook is Test, Deployers {
             }),
             ZERO_BYTES
         );
-
-        assertEq(
-            hook.positionCreationBlockNumber(Position.calculatePositionKey(lpAddress, -60, 60, bytes32(0))), blockNumber
-        );
+        PoolId poolId = key.toId();
+        bytes32 positionKey = Position.calculatePositionKey(lpAddress, -60, 60, bytes32(0));
+        assertEq(hook.positionCreationBlockNumber(poolId, positionKey), blockNumber);
     }
 
     function test_timeLockRevertsLiquidityRemoval() public {
@@ -112,5 +116,79 @@ contract TestGasPriceFeesHook is Test, Deployers {
             }),
             ZERO_BYTES
         );
+    }
+
+    function test_partialWithdrawalRevertsLiquidityRemoval() public {
+        // adds liquidity
+        modifyLiquidityRouter.modifyLiquidity(
+            key,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: 10 ether,
+                salt: bytes32(0)
+            }),
+            ZERO_BYTES
+        );
+        // waits enough blocks
+        uint256 lockDuration = hook.positionLockDuration();
+        vm.roll(block.number + lockDuration);
+        // tries to remove liquidity
+        vm.expectRevert();
+        modifyLiquidityRouter.modifyLiquidity(
+            key,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: -5 ether,
+                salt: bytes32(0)
+            }),
+            ZERO_BYTES
+        );
+    }
+
+    function test_infoCollectedAfterSwap() public {
+        // lp position
+        assertEq(block.number, 1);
+        modifyLiquidityRouter.modifyLiquidity(
+            key,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: 10000 ether,
+                salt: bytes32(0)
+            }),
+            ZERO_BYTES
+        );
+        assertEq(block.number, 1);
+        // swap in the same block
+        swapRouter.swap(
+            key,
+            IPoolManager.SwapParams({
+                zeroForOne: true,
+                amountSpecified: 1 ether,
+                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ZERO_BYTES
+        );
+        // some transaction happens next block and triggers info collection
+        vm.roll(block.number + 1);
+        assertEq(block.number, 2);
+        swapRouter.swap(
+            key,
+            IPoolManager.SwapParams({
+                zeroForOne: true,
+                amountSpecified: 1 ether,
+                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ZERO_BYTES
+        );
+        PoolId poolId = key.toId();
+        bytes32 positionKey = Position.calculatePositionKey(address(modifyLiquidityRouter), -60, 60, bytes32(0));
+
+        assertGt(hook.subtractFeeGrowthInside0LastX128(poolId, positionKey), 0);
+        assertGt(hook.subtractFeeGrowthInside1LastX128(poolId, positionKey), 0);
     }
 }
