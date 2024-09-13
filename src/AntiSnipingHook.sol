@@ -11,6 +11,9 @@ import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
 import {BalanceDelta, BalanceDeltaLibrary} from "v4-core/types/BalanceDelta.sol";
 import {LPFeeLibrary} from "v4-core/libraries/LPFeeLibrary.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/types/BeforeSwapDelta.sol";
+import {FullMath} from "v4-core/libraries/FullMath.sol";
+import {FixedPoint128} from "v4-core/libraries/FixedPoint128.sol";
+import "forge-std/console.sol";
 
 contract AntiSnipingHook is BaseHook {
     using StateLibrary for IPoolManager;
@@ -24,10 +27,11 @@ contract AntiSnipingHook is BaseHook {
     mapping(PoolId => uint256) lastSeenBlockNumber;
     mapping(PoolId => bytes32[]) positionsCreatedInLastSeenBlock;
 
-    mapping(PoolId => mapping(bytes32 => uint256)) public startFeeGrowthInside0LastX128;
-    mapping(PoolId => mapping(bytes32 => uint256)) public startFeeGrowthInside1LastX128;
-    mapping(PoolId => mapping(bytes32 => uint256)) public subtractFeeGrowthInside0LastX128;
-    mapping(PoolId => mapping(bytes32 => uint256)) public subtractFeeGrowthInside1LastX128;
+    mapping(PoolId => mapping(bytes32 => uint256)) public feesAccruedInFirstBlock0;
+    mapping(PoolId => mapping(bytes32 => uint256)) public feesAccruedInFirstBlock1;
+
+    mapping(PoolId => mapping(bytes32 => int24)) public positionKeyToTickLower;
+    mapping(PoolId => mapping(bytes32 => int24)) public positionKeyToTickUpper;
 
     error PositionLocked();
     error PositionAlreadyExists(); // positions are not modifiable after creation - prevent edge cases;
@@ -65,10 +69,16 @@ contract AntiSnipingHook is BaseHook {
             bytes32 positionKey = positionsCreatedInLastSeenBlock[poolId][i];
             (uint128 liquidity, uint256 feeGrowthInside0LastX128, uint256 feeGrowthInside1LastX128) =
                 StateLibrary.getPositionInfo(poolManager, poolId, positionKey);
-            subtractFeeGrowthInside0LastX128[poolId][positionKey] +=
-                feeGrowthInside0LastX128 - startFeeGrowthInside0LastX128[poolId][positionKey];
-            subtractFeeGrowthInside1LastX128[poolId][positionKey] +=
-                feeGrowthInside1LastX128 - startFeeGrowthInside1LastX128[poolId][positionKey];
+            int24 tickLower = positionKeyToTickLower[poolId][positionKey];
+            int24 tickUpper = positionKeyToTickUpper[poolId][positionKey];
+            (uint256 feeGrowthInside0X128, uint256 feeGrowthInside1X128) =
+                StateLibrary.getFeeGrowthInside(poolManager, poolId, tickLower, tickUpper);
+            uint256 feeGrowthDiffSinceLastBlockInside0X128 = feeGrowthInside0X128 - feeGrowthInside0LastX128;
+            uint256 feeGrowthDiffSinceLastBlockInside1X128 = feeGrowthInside1X128 - feeGrowthInside1LastX128;
+            feesAccruedInFirstBlock0[poolId][positionKey] =
+                FullMath.mulDiv(feeGrowthDiffSinceLastBlockInside0X128, uint256(liquidity), FixedPoint128.Q128);
+            feesAccruedInFirstBlock1[poolId][positionKey] =
+                FullMath.mulDiv(feeGrowthDiffSinceLastBlockInside1X128, uint256(liquidity), FixedPoint128.Q128);
         }
     }
 
@@ -84,10 +94,8 @@ contract AntiSnipingHook is BaseHook {
         require(positionCreationBlockNumber[poolId][positionKey] == 0, PositionAlreadyExists());
         positionCreationBlockNumber[poolId][positionKey] = block.number;
         positionsCreatedInLastSeenBlock[poolId].push(positionKey);
-        (uint128 liquidity, uint256 feeGrowthInside0LastX128, uint256 feeGrowthInside1LastX128) =
-            StateLibrary.getPositionInfo(poolManager, poolId, positionKey);
-        startFeeGrowthInside0LastX128[poolId][positionKey] = feeGrowthInside0LastX128;
-        startFeeGrowthInside1LastX128[poolId][positionKey] = feeGrowthInside1LastX128;
+        positionKeyToTickLower[poolId][positionKey] = params.tickLower;
+        positionKeyToTickUpper[poolId][positionKey] = params.tickUpper;
         return (this.beforeAddLiquidity.selector);
     }
 
@@ -95,22 +103,24 @@ contract AntiSnipingHook is BaseHook {
         address sender,
         PoolKey calldata key,
         IPoolManager.ModifyLiquidityParams calldata params,
-        BalanceDelta,
-        BalanceDelta,
+        BalanceDelta callerDelta,
+        BalanceDelta feesAccrued,
         bytes calldata
     ) external override returns (bytes4, BalanceDelta) {
         PoolId poolId = key.toId();
         bytes32 positionKey = Position.calculatePositionKey(sender, params.tickLower, params.tickUpper, params.salt);
+
+        // cleanup
         delete positionCreationBlockNumber[poolId][positionKey];
-        delete startFeeGrowthInside0LastX128[poolId][positionKey];
-        delete startFeeGrowthInside1LastX128[poolId][positionKey];
-        delete subtractFeeGrowthInside0LastX128[poolId][positionKey];
-        delete subtractFeeGrowthInside1LastX128[poolId][positionKey];
-        // todo: subtract 1st block fee growth from the output
+        delete feesAccruedInFirstBlock0[poolId][positionKey];
+        delete feesAccruedInFirstBlock1[poolId][positionKey];
+        delete positionKeyToTickLower[poolId][positionKey];
+        delete positionKeyToTickUpper[poolId][positionKey];
+
         return (this.afterRemoveLiquidity.selector, BalanceDeltaLibrary.ZERO_DELTA);
     }
 
-    function beforeSwap(address sender, PoolKey calldata key, IPoolManager.SwapParams calldata, bytes calldata)
+    function beforeSwap(address, PoolKey calldata key, IPoolManager.SwapParams calldata, bytes calldata)
         external
         override
         returns (bytes4, BeforeSwapDelta, uint24)
@@ -120,7 +130,7 @@ contract AntiSnipingHook is BaseHook {
         return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
-    function beforeDonate(address sender, PoolKey calldata key, uint256, uint256, bytes calldata)
+    function beforeDonate(address, PoolKey calldata key, uint256, uint256, bytes calldata)
         external
         override
         returns (bytes4)
@@ -142,8 +152,7 @@ contract AntiSnipingHook is BaseHook {
         require(
             block.number - positionCreationBlockNumber[poolId][positionKey] >= positionLockDuration, PositionLocked()
         );
-        (uint128 liquidity, uint256 feeGrowthInside0LastX128, uint256 feeGrowthInside1LastX128) =
-            StateLibrary.getPositionInfo(poolManager, poolId, positionKey);
+        (uint128 liquidity,,) = StateLibrary.getPositionInfo(poolManager, poolId, positionKey);
         require(int128(liquidity) + params.liquidityDelta == 0, PositionPartiallyWithdrawn());
         return (this.beforeRemoveLiquidity.selector);
     }

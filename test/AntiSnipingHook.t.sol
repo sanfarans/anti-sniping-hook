@@ -147,9 +147,8 @@ contract TestGasPriceFeesHook is Test, Deployers {
         );
     }
 
-    function test_infoCollectedAfterSwap() public {
-        // lp position
-        assertEq(block.number, 1);
+    function test_firstBlockFeesRedistributed() public {
+        // LP position
         modifyLiquidityRouter.modifyLiquidity(
             key,
             IPoolManager.ModifyLiquidityParams({
@@ -160,7 +159,6 @@ contract TestGasPriceFeesHook is Test, Deployers {
             }),
             ZERO_BYTES
         );
-        assertEq(block.number, 1);
         // swap in the same block
         swapRouter.swap(
             key,
@@ -174,13 +172,12 @@ contract TestGasPriceFeesHook is Test, Deployers {
         );
         // some transaction happens next block and triggers info collection
         vm.roll(block.number + 1);
-        assertEq(block.number, 2);
         swapRouter.swap(
             key,
             IPoolManager.SwapParams({
-                zeroForOne: true,
+                zeroForOne: false,
                 amountSpecified: 1 ether,
-                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+                sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
             }),
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ZERO_BYTES
@@ -188,7 +185,9 @@ contract TestGasPriceFeesHook is Test, Deployers {
         PoolId poolId = key.toId();
         bytes32 positionKey = Position.calculatePositionKey(address(modifyLiquidityRouter), -60, 60, bytes32(0));
 
-        assertGt(hook.subtractFeeGrowthInside0LastX128(poolId, positionKey), 0);
-        assertGt(hook.subtractFeeGrowthInside1LastX128(poolId, positionKey), 0);
+        // token0 diff should be positive because zeroForOne swap happened in the same block LP position was created
+        assertGt(hook.feesAccruedInFirstBlock0(poolId, positionKey), 0);
+        // token1 diff should be 0 because oneForZero swap happened in the next block
+        assertEq(hook.feesAccruedInFirstBlock1(poolId, positionKey), 0);
     }
 }
