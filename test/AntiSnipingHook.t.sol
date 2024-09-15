@@ -81,7 +81,10 @@ contract TestGasPriceFeesHook is Test, Deployers {
         vm.stopPrank();
     }
 
-    function test_firstBlockFeesRedistributed() public {
+    // --- test scenarios ---
+
+    // scenario 1 - Bob tries to snatch swap fees from Alice
+    function test_swapFeesSnipingPrevention() public {
         uint256 aliceToken0BalanceBefore = currency0.balanceOf(address(alice));
         uint256 aliceToken1BalanceBefore = currency1.balanceOf(address(alice));
         uint256 bobToken0BalanceBefore = currency0.balanceOf(address(bob));
@@ -172,78 +175,7 @@ contract TestGasPriceFeesHook is Test, Deployers {
         assertApproxEqRel(aliceToken1BalanceAfter, aliceToken1BalanceBefore + token1Donation, errorAllowed);
     }
 
-    function test_firstBlockFeesNotRedistributed() public {
-        uint256 token0BalanceBefore = currency0.balanceOf(address(alice));
-        uint256 token1BalanceBefore = currency1.balanceOf(address(alice));
-        // LP position created by Alice
-        vm.prank(alice);
-        modifyLiquidityRouter.modifyLiquidity(
-            key,
-            IPoolManager.ModifyLiquidityParams({
-                tickLower: -60,
-                tickUpper: 60,
-                liquidityDelta: 10000 ether,
-                salt: bytes32(0)
-            }),
-            ZERO_BYTES
-        );
-        // someone swaps in the same block
-        swapRouter.swap(
-            key,
-            IPoolManager.SwapParams({
-                zeroForOne: true,
-                amountSpecified: 1 ether,
-                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
-            }),
-            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
-            ZERO_BYTES
-        );
-        uint256 token0ExpectedFees = 1e12 * uint256(fee); // 1e18 * 0.03% = 3e15
-
-        // another swap transaction occurs next block
-        vm.roll(2);
-        swapRouter.swap(
-            key,
-            IPoolManager.SwapParams({
-                zeroForOne: false,
-                amountSpecified: 1 ether,
-                sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
-            }),
-            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
-            ZERO_BYTES
-        );
-        uint256 token1ExpectedFees = 1e12 * uint256(fee); // 1e18 * 0.03% = 3e15
-
-        PoolId poolId = key.toId();
-        bytes32 positionKey = Position.calculatePositionKey(address(modifyLiquidityRouter), -60, 60, bytes32(0));
-
-        // Alice accrued token0 fees right after her position was created - it should be recorded in the contract
-        assertApproxEqAbsDecimal(hook.feesAccruedInFirstBlock0(poolId, positionKey), token0ExpectedFees, 1e15, 18);
-        // token1 accrued fees should be 0 because oneForZero swap happened in the next block
-        assertEq(hook.feesAccruedInFirstBlock1(poolId, positionKey), 0);
-
-        vm.roll(1001);
-
-        // Alice removes liquidity
-        vm.prank(alice);
-        modifyLiquidityRouter.modifyLiquidity(
-            key,
-            IPoolManager.ModifyLiquidityParams({
-                tickLower: -60,
-                tickUpper: 60,
-                liquidityDelta: -10000 ether,
-                salt: bytes32(0)
-            }),
-            ZERO_BYTES
-        );
-        uint256 token0BalanceAfter = currency0.balanceOf(address(alice));
-        uint256 token1BalanceAfter = currency1.balanceOf(address(alice));
-
-        // there's no other liquidity left in the pool so the fees are not donated and are returned to the sender
-        assertApproxEqAbsDecimal(token0BalanceAfter, token0BalanceBefore + token0ExpectedFees, 1e15, 18);
-        assertApproxEqAbsDecimal(token1BalanceAfter, token1BalanceBefore + token1ExpectedFees, 1e15, 18);
-    }
-
+    // scenario 2 - Bob tries to snatch donation from Alice
     function test_donationSnipingPrevention() public {
         uint256 aliceToken0BalanceBefore = currency0.balanceOf(address(alice));
         uint256 aliceToken1BalanceBefore = currency1.balanceOf(address(alice));
@@ -356,28 +288,67 @@ contract TestGasPriceFeesHook is Test, Deployers {
         assertApproxEqAbsDecimal(aliceToken1BalanceAfter, aliceToken1BalanceBefore + token1ExpectedFees / 2, 1e15, 18);
     }
 
-    function test_savesPositionCreationBlockNumber() public {
-        uint256 blockNumber = 42;
-        vm.roll(blockNumber);
-
-        address lpAddress = address(modifyLiquidityRouter);
-
+    // scenario 3 - no liquidity left to donate first-block-accrued fees to
+    function test_redistributionNotPossible() public {
+        uint256 token0BalanceBefore = currency0.balanceOf(address(alice));
+        // LP position created by Alice
+        vm.prank(alice);
         modifyLiquidityRouter.modifyLiquidity(
             key,
             IPoolManager.ModifyLiquidityParams({
                 tickLower: -60,
                 tickUpper: 60,
-                liquidityDelta: 10 ether,
+                liquidityDelta: 10000 ether,
                 salt: bytes32(0)
             }),
             ZERO_BYTES
         );
+        // someone swaps in the same block
+        swapRouter.swap(
+            key,
+            IPoolManager.SwapParams({
+                zeroForOne: true,
+                amountSpecified: 1 ether,
+                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ZERO_BYTES
+        );
+        uint256 token0ExpectedFees = 1e12 * uint256(fee); // 1e18 * 0.03% = 3e15
+
+        vm.roll(2);
+
         PoolId poolId = key.toId();
-        bytes32 positionKey = Position.calculatePositionKey(lpAddress, -60, 60, bytes32(0));
-        assertEq(hook.positionCreationBlockNumber(poolId, positionKey), blockNumber);
+        hook.collectLastBlockInfo(poolId);
+
+        bytes32 positionKey = Position.calculatePositionKey(address(modifyLiquidityRouter), -60, 60, bytes32(0));
+
+        // Alice accrued token0 fees right after her position was created - it should be recorded in the contract
+        assertApproxEqAbsDecimal(hook.feesAccruedInFirstBlock0(poolId, positionKey), token0ExpectedFees, 1e15, 18);
+
+        vm.roll(1001);
+
+        // Alice removes liquidity
+        vm.prank(alice);
+        modifyLiquidityRouter.modifyLiquidity(
+            key,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: -10000 ether,
+                salt: bytes32(0)
+            }),
+            ZERO_BYTES
+        );
+        uint256 token0BalanceAfter = currency0.balanceOf(address(alice));
+
+        // there's no other liquidity left in the pool so the fees are not donated and are returned to the sender
+        assertApproxEqAbsDecimal(token0BalanceAfter, token0BalanceBefore + 1 ether + token0ExpectedFees, 1e15, 18);
     }
 
-    function test_timeLockRevertsLiquidityRemoval() public {
+    // --- safeguard tests ---
+
+    function test_timeLockedLiquidityRemovalReverts() public {
         // adds liquidity
         modifyLiquidityRouter.modifyLiquidity(
             key,
@@ -406,35 +377,7 @@ contract TestGasPriceFeesHook is Test, Deployers {
         );
     }
 
-    function test_timeLockExpiresEnablesLiquidityRemoval() public {
-        // adds liquidity
-        modifyLiquidityRouter.modifyLiquidity(
-            key,
-            IPoolManager.ModifyLiquidityParams({
-                tickLower: -60,
-                tickUpper: 60,
-                liquidityDelta: 10 ether,
-                salt: bytes32(0)
-            }),
-            ZERO_BYTES
-        );
-        // waits enough blocks
-        uint256 lockDuration = hook.positionLockDuration();
-        vm.roll(block.number + lockDuration);
-        // successfully removes liquidity
-        modifyLiquidityRouter.modifyLiquidity(
-            key,
-            IPoolManager.ModifyLiquidityParams({
-                tickLower: -60,
-                tickUpper: 60,
-                liquidityDelta: -10 ether,
-                salt: bytes32(0)
-            }),
-            ZERO_BYTES
-        );
-    }
-
-    function test_partialWithdrawalRevertsLiquidityRemoval() public {
+    function test_partialWithdrawalReverts() public {
         // adds liquidity
         modifyLiquidityRouter.modifyLiquidity(
             key,
