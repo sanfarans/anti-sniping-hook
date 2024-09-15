@@ -61,7 +61,7 @@ contract AntiSnipingHook is BaseHook {
     }
 
     // for positions created in the last seen block, collect how much fees they accrued
-    function collectLastBlockInfo(PoolId poolId) internal {
+    function collectLastBlockInfo(PoolId poolId) public {
         if (block.number <= lastSeenBlockNumber[poolId]) {
             return;
         }
