@@ -22,7 +22,8 @@ contract AntiSnipingHook is BaseHook {
 
     // used for time-locking positions
     mapping(PoolId => mapping(bytes32 => uint256)) public positionCreationBlockNumber;
-    uint256 public positionLockDuration = 1000;
+    uint128 public positionLockDuration;
+    uint128 public sameBlockPositionsLimit;
 
     // used for tracking positions created in the last seen block - to collect the changes in fee growth
     mapping(PoolId => uint256) lastSeenBlockNumber;
@@ -38,8 +39,14 @@ contract AntiSnipingHook is BaseHook {
     error PositionAlreadyExists(); // positions are not modifiable after creation - prevent edge cases;
     // still it is possible to create a similar position with a different salt
     error PositionPartiallyWithdrawn();
+    error TooManyPositionsOpenedSameBlock(); // to prevent having to many positions to go through when collecting info (gas costly)
 
-    constructor(IPoolManager _poolManager) BaseHook(_poolManager) {}
+    constructor(IPoolManager _poolManager, uint128 _positionLockDuration, uint128 _sameBlockPoistionsLimit)
+        BaseHook(_poolManager)
+    {
+        positionLockDuration = _positionLockDuration;
+        sameBlockPositionsLimit = _sameBlockPoistionsLimit;
+    }
 
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
@@ -132,6 +139,7 @@ contract AntiSnipingHook is BaseHook {
         collectLastBlockInfo(poolId);
         bytes32 positionKey = Position.calculatePositionKey(sender, params.tickLower, params.tickUpper, params.salt);
         require(positionCreationBlockNumber[poolId][positionKey] == 0, PositionAlreadyExists());
+        require(positionsCreatedInLastSeenBlock[poolId].length < sameBlockPositionsLimit);
         positionCreationBlockNumber[poolId][positionKey] = block.number;
         positionsCreatedInLastSeenBlock[poolId].push(positionKey);
         positionKeyToTickLower[poolId][positionKey] = params.tickLower;

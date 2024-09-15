@@ -28,6 +28,8 @@ contract TestGasPriceFeesHook is Test, Deployers {
 
     AntiSnipingHook hook;
     uint24 fee = 3000;
+    uint128 positionLockDuration = 1000;
+    uint128 sameBlockPositionsLimit = 5;
 
     address alice = address(0x1); // good liquidity provider
     address bob = address(0x2); // wanna-be sniper
@@ -44,7 +46,7 @@ contract TestGasPriceFeesHook is Test, Deployers {
             )
         );
 
-        deployCodeTo("AntiSnipingHook", abi.encode(manager), hookAddress);
+        deployCodeTo("AntiSnipingHook", abi.encode(manager, positionLockDuration, sameBlockPositionsLimit), hookAddress);
         hook = AntiSnipingHook(hookAddress);
 
         (key,) = initPool(currency0, currency1, hook, fee, SQRT_PRICE_1_1, ZERO_BYTES);
@@ -136,7 +138,7 @@ contract TestGasPriceFeesHook is Test, Deployers {
         assertApproxEqRel(hook.feesAccruedInFirstBlock0(poolId, bobPositionKey), token0Donation / 2, errorAllowed);
         assertApproxEqRel(hook.feesAccruedInFirstBlock1(poolId, bobPositionKey), token1Donation / 2, errorAllowed);
 
-        vm.roll(1002);
+        vm.roll(positionLockDuration + 2);
 
         // Bob takes his liquidity out first
         vm.prank(bob);
@@ -249,7 +251,7 @@ contract TestGasPriceFeesHook is Test, Deployers {
         // Bob's token1 accrued fees should be 0 because oneForZero swap happened in the next block
         assertEq(hook.feesAccruedInFirstBlock1(poolId, bobPositionKey), 0);
 
-        vm.roll(1002);
+        vm.roll(positionLockDuration + 2);
 
         // Bob takes his liquidity out first
         vm.prank(bob);
@@ -326,7 +328,7 @@ contract TestGasPriceFeesHook is Test, Deployers {
         // Alice accrued token0 fees right after her position was created - it should be recorded in the contract
         assertApproxEqAbsDecimal(hook.feesAccruedInFirstBlock0(poolId, positionKey), token0ExpectedFees, 1e15, 18);
 
-        vm.roll(1001);
+        vm.roll(positionLockDuration + 1);
 
         // Alice removes liquidity
         vm.prank(alice);
@@ -390,8 +392,7 @@ contract TestGasPriceFeesHook is Test, Deployers {
             ZERO_BYTES
         );
         // waits enough blocks
-        uint256 lockDuration = hook.positionLockDuration();
-        vm.roll(block.number + lockDuration);
+        vm.roll(positionLockDuration);
         // tries to remove liquidity
         vm.expectRevert();
         modifyLiquidityRouter.modifyLiquidity(
@@ -400,6 +401,32 @@ contract TestGasPriceFeesHook is Test, Deployers {
                 tickLower: -60,
                 tickUpper: 60,
                 liquidityDelta: -5 ether,
+                salt: bytes32(0)
+            }),
+            ZERO_BYTES
+        );
+    }
+
+    function test_goingOverSameBlockPositionsLimitReverts() public {
+        for (uint256 i = 0; i < sameBlockPositionsLimit; ++i) {
+            modifyLiquidityRouter.modifyLiquidity(
+                key,
+                IPoolManager.ModifyLiquidityParams({
+                    tickLower: -60,
+                    tickUpper: 60,
+                    liquidityDelta: 10 ether,
+                    salt: bytes32(i)
+                }),
+                ZERO_BYTES
+            );
+        }
+        vm.expectRevert();
+        modifyLiquidityRouter.modifyLiquidity(
+            key,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: 10 ether,
                 salt: bytes32(0)
             }),
             ZERO_BYTES
